@@ -190,7 +190,7 @@
                     </item_prototypes>
                     <trigger_prototypes>
                         <trigger_prototype>
-                            <expression>{Quagga bgp sessions:bgp.peer.[{#PEER_IP}, state].last(,5)}&lt;-1</expression>
+                            <expression>{Quagga bgp sessions:bgp.peer.[{#PEER_IP}, state].last(,5)}&gt;-8</expression>
                             <recovery_mode>0</recovery_mode>
                             <recovery_expression/>
                             <name>BGP session - {#PEER_IP} {#DESCRIPTION} is down</name>
