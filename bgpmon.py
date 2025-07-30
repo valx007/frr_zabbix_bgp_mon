@@ -8,106 +8,180 @@ import os
 import time
 
 VAL_MAP = {
-    "Idle (Admin)": {"state": -1},
-    "Idle (PfxCt)": {"state": -2},
-    "Idle": {"state": -3},
-    "Connect": {"state": -4},
-    "Active": {"state": -5},
-    "OpenSent": {"state": -6},
-    "OpenConfirm": {"state": -7},
-    "Established": {"state": -8}
+    "Idle (Admin)": -1,
+    "Idle (PfxCt)": -2,
+    "Idle": -3,
+    "Connect": -4,
+    "Active": -5,
+    "OpenSent": -6,
+    "OpenConfirm": -7,
+    "Established": -8
 }
 
 JSONFILE = '/tmp/bgpmon.json'
 CACHELIFE = 60
 
 parser = argparse.ArgumentParser()
-parser.add_argument("action", help="discovery | neighbor_settings ")
+parser.add_argument("action", help="discovery | neighbor_state")
 parser.add_argument("-n", help="neighbor")
 args = parser.parse_args()
-
 
 def run_config():
     neighbor_settings = {}
     try:
         process = subprocess.Popen(
-            ["vtysh", "-c", "show run"], stdout=subprocess.PIPE)
-    except IOError:
-        print "ZBX_NOTSUPPORTED"
+            ["vtysh", "-c", "show running-config"], 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE
+        )
+        out, err = process.communicate()
+        if process.returncode != 0:
+            raise Exception(f"vtysh error: {err.decode().strip()}")
+        out = out.decode()
+    except Exception as e:
+        print(f"ZBX_NOTSUPPORTED: {str(e)}")
         sys.exit(1)
-    out, err = process.communicate()
-    pattern = r'neighbor\s*([0-9.]+)\s*(maximum-prefix|description|remote-as)'\
-        '\s*([\w-]+)'
-    for line in out.split("/n"):
-        neighbors = (re.findall(pattern, line))
-
-    for neighbor in neighbors:
-        if neighbor_settings.get(neighbor[0]):
-            neighbor_settings[neighbor[0]].update({neighbor[1]: neighbor[2]})
-        else:
-            neighbor_settings[neighbor[0]] = {neighbor[1]: neighbor[2]}
+    
+    pattern = r'neighbor\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(description|remote-as|maximum-prefix)\s+(.*)'
+    matches = re.findall(pattern, out)
+    
+    for match in matches:
+        ip = match[0]
+        key = match[1]
+        value = match[2].split('!', 1)[0].strip()
+        
+        if ip not in neighbor_settings:
+            neighbor_settings[ip] = {}
+        
+        if key in ['remote-as', 'maximum-prefix']:
+            try:
+                value = int(value)
+            except ValueError:
+                pass
+        
+        neighbor_settings[ip][key] = value
 
     with open(JSONFILE, 'w') as f:
-        json.dump({"neighbor_settings": neighbor_settings}, f)
+        json.dump({
+            "neighbor_settings": neighbor_settings,
+            "timestamp": time.time()
+        }, f)
 
-    return {"neighbor_settings": neighbor_settings}
-
+    return neighbor_settings
 
 def bgp_summary():
-    result = []
+    neighbors = {}
     try:
         process = subprocess.Popen(
-            ["vtysh", "-c", "show ip bgp summary"], stdout=subprocess.PIPE)
-    except IOError:
-        print("ZBX_NOTSUPPORTED")
+            ["vtysh", "-c", "show bgp summary"], 
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        out, err = process.communicate()
+        if process.returncode != 0:
+            raise Exception(f"vtysh error: {err.decode().strip()}")
+        out = out.decode()
+    except Exception as e:
+        print(f"ZBX_NOTSUPPORTED: {str(e)}")
         sys.exit(1)
-
-    out, err = process.communicate()
-    for line in out.split("\n"):
-        out = (re.findall(r'^([\w.]+)(\s+\S+){8}([\w)(\s]+$)', line))
-        if out:
-            result.append({out[0][0]: {"state": out[0][2].strip()}})
+    
+    # Парсим вывод построчно
+    for line in out.splitlines():
+        # Пропускаем служебные строки
+        if not line.strip() or 'Neighbor' in line or 'IPv4' in line or 'BGP' in line:
+            continue
+        
+        # Разбиваем строку на колонки
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        
+        # Извлекаем IP-адрес
+        ip = parts[0]
+        
+        # Определяем состояние
+        # Состояние всегда перед последним числовым столбцом (PfxSnt)
+        # Ищем первое нечисловое поле после времени Up/Down
+        state_index = 9
+        state = ""
+        
+        # Пытаемся найти начало состояния
+        for i in range(9, len(parts)):
+            # Если встретили число - это количество префиксов (PfxRcd)
+            if parts[i].replace(',', '').isdigit():
+                # Если это первый столбец после времени - значит состояние Established
+                if i == 9:
+                    state = "Established"
+                break
+            # Проверяем ключевые слова состояний
+            if any(parts[i].startswith(s) for s in ["Idle", "Connect", "Active", "Open", "Estab"]):
+                state_parts = []
+                # Собираем все части состояния
+                for j in range(i, len(parts)):
+                    # Прерываем при встрече числа (количества префиксов)
+                    if parts[j].replace(',', '').isdigit():
+                        break
+                    state_parts.append(parts[j])
+                state = " ".join(state_parts)
+                break
+        
+        # Если состояние не найдено, используем значение по умолчанию
+        if not state:
+            state = parts[9] if len(parts) > 9 else "Unknown"
+        
+        neighbors[ip] = state
 
     with open(JSONFILE, 'w') as f:
-        json.dump({"neighbors": result}, f)
+        json.dump({
+            "neighbors": neighbors,
+            "timestamp": time.time()
+        }, f)
+    
+    return neighbors
 
-    return {"neighbors": result}
+def get_cached_data():
+    if not os.path.exists(JSONFILE):
+        return None
+        
+    try:
+        with open(JSONFILE) as f:
+            data = json.load(f)
+            if time.time() - data.get('timestamp', 0) <= CACHELIFE:
+                return data
+    except:
+        pass
+    return None
 
 if __name__ == '__main__':
-    json_cache = None
     result = None
-    if os.path.exists(JSONFILE):
-        time_cur_json = os.path.getmtime(JSONFILE)
-        if time.time() - time_cur_json <= CACHELIFE:
-            with open(JSONFILE) as f:
-                json_cache = json.load(f)
-
-    if args.action == 'neighbor_state' and args.n:
-        if not json_cache or not json_cache.get("neighbors"):
-            json_cache = bgp_summary()
-
-        for n in json_cache["neighbors"]:
-            if n.get(args.n):
-                value = n.get(args.n)
-                result = VAL_MAP.get(value["state"], value)
-                break
+    json_cache = get_cached_data()
 
     if args.action == 'discovery':
-        if not json_cache or not json_cache.get("neighbor_settings"):
-            json_cache = run_config()
-
+        if not json_cache or 'neighbor_settings' not in json_cache:
+            settings = run_config()
+        else:
+            settings = json_cache['neighbor_settings']
+        
         result = {"data": []}
-        for n in json_cache["neighbor_settings"].items():
-            description = n[1].get("description", "No description")
-            maximum_prefix = n[1].get("maximum-prefix", -1)
-            value = {
-                "{#PEER_IP}": n[0],
-                "{#DESCRIPTION}": description,
-                "{#MAX-PREFIX}": maximum_prefix}
-            result["data"].append(value)
+        for ip, config in settings.items():
+            result["data"].append({
+                "{#PEER_IP}": ip,
+                "{#DESCRIPTION}": config.get('description', 'N/A'),
+                "{#MAX-PREFIX}": config.get('maximum-prefix', -1)
+            })
 
-    if not result:
+    elif args.action == 'neighbor_state' and args.n:
+        if not json_cache or 'neighbors' not in json_cache:
+            states = bgp_summary()
+        else:
+            states = json_cache['neighbors']
+        
+        state = states.get(args.n, '')
+        # Возвращаем JSON-объект вместо простого числа
+        result = {"state": VAL_MAP.get(state, 0)}
+
+    if result is None:
         print("ZBX_NOTSUPPORTED")
         sys.exit(1)
 
-    print(json.dumps(result, indent=4, sort_keys=True))
+    print(json.dumps(result))
