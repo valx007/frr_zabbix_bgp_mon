@@ -1,4 +1,4 @@
-# Monitoring quagga BGP session  for zabbix
+# Monitoring FRR BGP session  for zabbix
 
 ## Description
 Descover and monitor BGP session with count of prefix or state like "Active" or Idle (Admin).
